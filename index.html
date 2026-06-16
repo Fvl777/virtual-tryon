@@ -1,0 +1,1434 @@
+<!DOCTYPE html>
+<!--
+  ╔══════════════════════════════════════════════════════════════════════════╗
+  ║         VIRTUAL TRY-ON (VTON) — Powered by transformers.js v3           ║
+  ║  Model: Xenova/segformer_b2_clothes  |  Backend: WebGPU → WASM          ║
+  ║  Privacy: Zero tracking, 100% client-side, no external pings            ║
+  ╚══════════════════════════════════════════════════════════════════════════╝
+  
+  ARCHITECTURE OVERVIEW
+  ─────────────────────
+  Main Thread  ←──IPC──→  Web Worker (worker.js inlined as Blob URL)
+       │                        │
+       │  postMessage(frame)    │  transformers.js pipeline
+       │ ──────────────────────>│  segformer_b2_clothes
+       │                        │  returns mask + bounding box
+       │ <──────────────────────│
+       ▼
+  Canvas 2D rendering
+  (webcam/photo + scaled clothing PNG overlay)
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Virtual Try-On</title>
+
+  <!-- ─── FONTS ─── -->
+  <!-- Inter for UI text; DM Sans for headings — deliberate pairing for a modern, airy tech product feel -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=Inter:wght@400;500&display=swap" rel="stylesheet" />
+
+  <style>
+    /* ═══════════════════════════════════════════════════
+       DESIGN TOKENS
+       Palette: Deep ink (#0f1117) bg, Electric violet (#7c5cfc) accent,
+       Soft lilac (#e8e2ff) highlights, Warm white (#f8f7ff) surfaces.
+       Risk: The clothing-card hover uses a prismatic gradient border —
+       unusual for try-on apps, anchors the "magic mirror" metaphor.
+    ═══════════════════════════════════════════════════ */
+    :root {
+      --bg:           #0f1117;
+      --surface:      #1a1d27;
+      --surface-2:    #232638;
+      --accent:       #7c5cfc;
+      --accent-light: #a68bfd;
+      --accent-dim:   #3d2e80;
+      --highlight:    #e8e2ff;
+      --text:         #e8e4f4;
+      --text-muted:   #8b88a8;
+      --success:      #4ade80;
+      --error:        #f87171;
+      --radius:       14px;
+      --radius-sm:    8px;
+      --shadow:       0 4px 32px rgba(0,0,0,.45);
+      --transition:   .22s cubic-bezier(.4,0,.2,1);
+    }
+
+    /* ─── RESET & BASE ─── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: 'Inter', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 0 12px 40px;
+      /* Subtle dot-grid background texture — the "magic mirror" signature detail */
+      background-image: radial-gradient(circle, rgba(124,92,252,.12) 1px, transparent 1px);
+      background-size: 28px 28px;
+    }
+
+    /* ─── HEADER ─── */
+    header {
+      width: 100%;
+      max-width: 800px;
+      text-align: center;
+      padding: 32px 0 20px;
+    }
+    .logo-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--surface);
+      border: 1px solid var(--accent-dim);
+      border-radius: 999px;
+      padding: 6px 16px 6px 10px;
+      font-size: .72rem;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: var(--accent-light);
+      margin-bottom: 16px;
+    }
+    .logo-badge span.dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 8px var(--accent);
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0%,100% { opacity:1; }
+      50%      { opacity:.4; }
+    }
+    h1 {
+      font-family: 'DM Sans', sans-serif;
+      font-size: clamp(1.6rem, 4vw, 2.4rem);
+      font-weight: 700;
+      letter-spacing: -.02em;
+      line-height: 1.15;
+      background: linear-gradient(135deg, #fff 30%, var(--accent-light));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .subtitle {
+      margin-top: 8px;
+      color: var(--text-muted);
+      font-size: .88rem;
+    }
+
+    /* ─── LOADING OVERLAY ─── */
+    /* Covers the whole UI while the model downloads; dismissed via JS */
+    #loading-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(15,17,23,.96);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 20px;
+      z-index: 9999;
+      padding: 24px;
+      text-align: center;
+      backdrop-filter: blur(4px);
+      transition: opacity .5s;
+    }
+    #loading-overlay.hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
+    .loading-icon {
+      width: 64px; height: 64px;
+      border-radius: 18px;
+      background: var(--accent-dim);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 2rem;
+      animation: float 3s ease-in-out infinite;
+    }
+    @keyframes float {
+      0%,100% { transform: translateY(0); }
+      50%      { transform: translateY(-8px); }
+    }
+    .loading-title {
+      font-family: 'DM Sans', sans-serif;
+      font-size: 1.3rem;
+      font-weight: 700;
+    }
+    .loading-status {
+      color: var(--text-muted);
+      font-size: .83rem;
+      max-width: 320px;
+      min-height: 2.5em;
+      line-height: 1.5;
+    }
+    /* Progress bar track */
+    .progress-track {
+      width: min(360px, 85vw);
+      height: 6px;
+      background: var(--surface-2);
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    /* Animated fill bar */
+    .progress-fill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, var(--accent-dim), var(--accent), var(--accent-light));
+      border-radius: 999px;
+      transition: width .3s ease;
+      position: relative;
+    }
+    /* Shimmer effect on the progress fill */
+    .progress-fill::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,.25) 50%, transparent 100%);
+      animation: shimmer 1.5s infinite;
+    }
+    @keyframes shimmer {
+      0%   { transform: translateX(-100%); }
+      100% { transform: translateX(100%); }
+    }
+    .progress-label {
+      font-size: .75rem;
+      color: var(--text-muted);
+    }
+
+    /* ─── MAIN LAYOUT ─── */
+    main {
+      width: 100%;
+      max-width: 800px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    /* ─── CARD COMPONENT ─── */
+    .card {
+      background: var(--surface);
+      border: 1px solid rgba(124,92,252,.2);
+      border-radius: var(--radius);
+      padding: 20px;
+    }
+    .card-title {
+      font-family: 'DM Sans', sans-serif;
+      font-size: .8rem;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: var(--text-muted);
+      margin-bottom: 14px;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+    }
+    .card-title::before {
+      content: '';
+      width: 3px; height: 14px;
+      background: var(--accent);
+      border-radius: 2px;
+      display: inline-block;
+    }
+
+    /* ─── STEP 1: INPUT CONTROLS ─── */
+    .input-row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .btn {
+      flex: 1;
+      min-width: 120px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 10px 18px;
+      border-radius: var(--radius-sm);
+      font-family: 'Inter', sans-serif;
+      font-size: .85rem;
+      font-weight: 500;
+      cursor: pointer;
+      border: none;
+      transition: var(--transition);
+      white-space: nowrap;
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+    }
+    .btn-primary:hover { background: var(--accent-light); transform: translateY(-1px); }
+    .btn-secondary {
+      background: var(--surface-2);
+      color: var(--text);
+      border: 1px solid rgba(255,255,255,.08);
+    }
+    .btn-secondary:hover { background: var(--accent-dim); border-color: var(--accent); }
+    .btn:disabled { opacity: .4; cursor: not-allowed; transform: none !important; }
+    .btn svg { flex-shrink: 0; }
+
+    /* Hidden file input — triggered by label/button */
+    #photo-upload { display: none; }
+
+    /* Status pill shown inside the input card */
+    .cam-status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: .78rem;
+      color: var(--text-muted);
+      margin-top: 12px;
+    }
+    .status-dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: var(--text-muted);
+      flex-shrink: 0;
+    }
+    .status-dot.active { background: var(--success); box-shadow: 0 0 6px var(--success); }
+    .status-dot.error  { background: var(--error);   box-shadow: 0 0 6px var(--error); }
+
+    /* ─── STEP 2: CLOTHING PICKER ─── */
+    .clothing-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));
+      gap: 10px;
+    }
+    /* Each swatch is a clickable card with the prismatic gradient border on hover/selected */
+    .clothing-item {
+      position: relative;
+      border-radius: var(--radius-sm);
+      background: var(--surface-2);
+      border: 2px solid transparent;
+      cursor: pointer;
+      overflow: hidden;
+      aspect-ratio: 3/4;
+      transition: var(--transition);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    /* Prismatic gradient border — the signature design risk */
+    .clothing-item::before {
+      content: '';
+      position: absolute;
+      inset: -2px;
+      border-radius: calc(var(--radius-sm) + 2px);
+      background: conic-gradient(from 180deg, #7c5cfc, #a68bfd, #e879f9, #7c5cfc);
+      z-index: 0;
+      opacity: 0;
+      transition: opacity var(--transition);
+    }
+    .clothing-item:hover::before,
+    .clothing-item.selected::before { opacity: 1; }
+    .clothing-item > * { position: relative; z-index: 1; }
+    .clothing-item img {
+      width: 100%; height: 100%;
+      object-fit: contain;
+      display: block;
+      padding: 6px;
+      background: var(--surface-2);
+      border-radius: var(--radius-sm);
+    }
+    /* Empty slots show a dashed placeholder with an add icon */
+    .clothing-item.placeholder {
+      border: 2px dashed rgba(255,255,255,.12);
+    }
+    .clothing-item.placeholder:hover { border-color: var(--accent); }
+    .placeholder-inner {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+      color: var(--text-muted);
+      font-size: .65rem;
+      text-align: center;
+      padding: 4px;
+    }
+    /* Label below each clothing card */
+    .clothing-label {
+      position: absolute;
+      bottom: 0; left: 0; right: 0;
+      background: rgba(15,17,23,.85);
+      font-size: .62rem;
+      text-align: center;
+      padding: 3px 4px;
+      border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+      color: var(--text-muted);
+      backdrop-filter: blur(4px);
+    }
+    /* Checkmark badge for selected item */
+    .selected-badge {
+      position: absolute;
+      top: 4px; right: 4px;
+      width: 18px; height: 18px;
+      border-radius: 50%;
+      background: var(--accent);
+      display: flex; align-items: center; justify-content: center;
+      font-size: .6rem;
+      opacity: 0;
+      transition: opacity var(--transition);
+      z-index: 2;
+    }
+    .clothing-item.selected .selected-badge { opacity: 1; }
+
+    /* Upload-your-own clothing button */
+    #clothing-upload { display: none; }
+    .upload-own-btn {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--accent-light);
+      font-size: .78rem;
+      cursor: pointer;
+      margin-top: 10px;
+      opacity: .8;
+      transition: opacity var(--transition);
+      background: none;
+      border: none;
+      font-family: inherit;
+      padding: 0;
+    }
+    .upload-own-btn:hover { opacity: 1; }
+
+    /* ─── STEP 3: CANVAS (TRY-ON VIEW) ─── */
+    .canvas-wrapper {
+      position: relative;
+      border-radius: var(--radius);
+      overflow: hidden;
+      background: #000;
+      aspect-ratio: 4/3;
+      /* Max height so canvas doesn't get unwieldy on desktop */
+      max-height: 480px;
+    }
+    #try-on-canvas {
+      width: 100%; height: 100%;
+      display: block;
+      object-fit: contain;
+    }
+    /* Overlay shown when no source is active */
+    .canvas-placeholder {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      color: var(--text-muted);
+      pointer-events: none;
+    }
+    .canvas-placeholder.hidden { display: none; }
+    .canvas-placeholder-icon { font-size: 3rem; opacity: .3; }
+    .canvas-placeholder p { font-size: .82rem; }
+
+    /* Inference status badge overlaid on the canvas */
+    #inference-badge {
+      position: absolute;
+      top: 10px; left: 10px;
+      background: rgba(15,17,23,.8);
+      border: 1px solid rgba(124,92,252,.4);
+      border-radius: 999px;
+      padding: 4px 12px;
+      font-size: .72rem;
+      color: var(--accent-light);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      backdrop-filter: blur(6px);
+      opacity: 0;
+      transition: opacity var(--transition);
+    }
+    #inference-badge.visible { opacity: 1; }
+    .spinner {
+      width: 10px; height: 10px;
+      border: 2px solid var(--accent-dim);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ─── CONTROLS BELOW CANVAS ─── */
+    .controls-row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 12px;
+    }
+
+    /* Opacity slider for clothing overlay */
+    .slider-group {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex: 1;
+      min-width: 180px;
+    }
+    .slider-label {
+      font-size: .75rem;
+      color: var(--text-muted);
+      white-space: nowrap;
+    }
+    input[type=range] {
+      flex: 1;
+      -webkit-appearance: none;
+      height: 4px;
+      border-radius: 2px;
+      background: var(--surface-2);
+      outline: none;
+      cursor: pointer;
+    }
+    input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 16px; height: 16px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 6px var(--accent);
+      cursor: pointer;
+    }
+
+    /* ─── ERROR TOAST ─── */
+    #error-toast {
+      position: fixed;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%) translateY(80px);
+      background: #2d1616;
+      border: 1px solid var(--error);
+      color: var(--error);
+      border-radius: var(--radius-sm);
+      padding: 10px 18px;
+      font-size: .82rem;
+      z-index: 9998;
+      transition: transform .3s, opacity .3s;
+      opacity: 0;
+      max-width: 90vw;
+      text-align: center;
+    }
+    #error-toast.show {
+      transform: translateX(-50%) translateY(0);
+      opacity: 1;
+    }
+
+    /* ─── FOOTER ─── */
+    footer {
+      margin-top: 28px;
+      font-size: .7rem;
+      color: var(--text-muted);
+      text-align: center;
+      opacity: .6;
+    }
+
+    /* ─── RESPONSIVE ─── */
+    @media (max-width: 480px) {
+      body { padding: 0 8px 28px; }
+      .card { padding: 14px; }
+      .clothing-grid { grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); }
+    }
+
+    /* ─── REDUCED MOTION ─── */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ══════════════════════════════════════════
+     LOADING OVERLAY — visible while model downloads
+     Progress is driven by transformers.js callbacks
+     sent from the Web Worker via postMessage
+══════════════════════════════════════════ -->
+<div id="loading-overlay" role="status" aria-live="polite">
+  <div class="loading-icon">🪞</div>
+  <div class="loading-title">Setting up the magic mirror</div>
+  <div class="loading-status" id="loading-status-text">
+    Loading AI clothing segmentation model…
+  </div>
+  <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress-bar-track">
+    <div class="progress-fill" id="progress-fill"></div>
+  </div>
+  <div class="progress-label" id="progress-label">Preparing…</div>
+</div>
+
+<!-- ══════════════════════════════════════════
+     ERROR TOAST — shown for non-fatal errors
+══════════════════════════════════════════ -->
+<div id="error-toast" role="alert"></div>
+
+<!-- ══════════════════════════════════════════
+     MAIN APP
+══════════════════════════════════════════ -->
+<header>
+  <div class="logo-badge">
+    <span class="dot"></span>
+    AI-Powered · Fully Private · Runs in Your Browser
+  </div>
+  <h1>Virtual Try-On</h1>
+  <p class="subtitle">Select a garment, then snap a photo or use your webcam to see it on you.</p>
+</header>
+
+<main>
+
+  <!-- ── CARD 1: Camera / Photo Input ── -->
+  <div class="card" id="input-card">
+    <div class="card-title">Your Photo</div>
+    <div class="input-row">
+      <!-- Webcam button -->
+      <button class="btn btn-primary" id="btn-webcam" aria-label="Start webcam">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M20 7h-3l-2-3H9L7 7H4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2z"/></svg>
+        Start Webcam
+      </button>
+
+      <!-- Upload photo button (acts as label for the hidden file input) -->
+      <label for="photo-upload" class="btn btn-secondary" role="button" tabindex="0"
+        aria-label="Upload a photo from your device">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        Upload Photo
+      </label>
+      <input type="file" id="photo-upload" accept="image/*" aria-label="Upload photo" />
+
+      <!-- Stop webcam -->
+      <button class="btn btn-secondary" id="btn-stop" style="display:none;" aria-label="Stop webcam">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
+        Stop
+      </button>
+    </div>
+    <!-- Live status indicator -->
+    <div class="cam-status" aria-live="polite">
+      <span class="status-dot" id="status-dot"></span>
+      <span id="status-text">No source active.</span>
+    </div>
+  </div>
+
+  <!-- ── CARD 2: Clothing Picker ── -->
+  <div class="card" id="clothing-card">
+    <div class="card-title">Choose a Garment</div>
+
+    <!-- 
+      Built-in demo garments: these are solid-colored rectangles drawn
+      programmatically to avoid needing external image assets.
+      Users can also upload their own transparent-background PNG.
+    -->
+    <div class="clothing-grid" id="clothing-grid">
+      <!-- Items are injected by JS; placeholders shown until selected -->
+    </div>
+
+    <!-- Upload your own PNG button -->
+    <label class="upload-own-btn" for="clothing-upload" role="button" tabindex="0">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+      Upload your own garment PNG (transparent background)
+    </label>
+    <input type="file" id="clothing-upload" accept="image/png,image/webp" aria-label="Upload custom garment" />
+  </div>
+
+  <!-- ── CARD 3: Try-On Canvas ── -->
+  <div class="card" style="padding: 14px;">
+    <div class="card-title">Try-On Preview</div>
+
+    <!-- Canvas wrapper with relative positioning for overlaid badges -->
+    <div class="canvas-wrapper">
+      <canvas id="try-on-canvas" aria-label="Virtual try-on preview"></canvas>
+
+      <!-- Placeholder when no image source is active -->
+      <div class="canvas-placeholder" id="canvas-placeholder">
+        <div class="canvas-placeholder-icon">👗</div>
+        <p>Activate your webcam or upload a photo to begin</p>
+      </div>
+
+      <!-- Inference status badge (processing…/ready) -->
+      <div id="inference-badge">
+        <div class="spinner"></div>
+        <span id="inference-text">Segmenting…</span>
+      </div>
+    </div>
+
+    <!-- Controls below the canvas -->
+    <div class="controls-row">
+      <!-- Opacity slider -->
+      <div class="slider-group">
+        <span class="slider-label">Opacity</span>
+        <input type="range" id="opacity-slider" min="10" max="100" value="85"
+          aria-label="Clothing overlay opacity" />
+      </div>
+
+      <!-- Save / screenshot button -->
+      <button class="btn btn-secondary" id="btn-save" style="flex:0 0 auto;"
+        aria-label="Save try-on image">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        Save
+      </button>
+    </div>
+  </div>
+
+</main>
+
+<footer>
+  All processing happens locally in your browser. No images leave your device. ✦ Powered by transformers.js &amp; Xenova/segformer_b2_clothes
+</footer>
+
+<!-- ══════════════════════════════════════════
+     HIDDEN VIDEO ELEMENT — used as webcam source
+     (not displayed; frames are drawn to canvas)
+══════════════════════════════════════════ -->
+<video id="webcam-video" autoplay playsinline muted style="display:none;" aria-hidden="true"></video>
+
+<!-- ══════════════════════════════════════════
+     HIDDEN PHOTO IMAGE — used as static source
+══════════════════════════════════════════ -->
+<img id="static-photo" style="display:none;" alt="" aria-hidden="true" />
+
+<script>
+/* ═══════════════════════════════════════════════════════════
+   WEB WORKER SOURCE — inlined as a Blob URL string.
+
+   WHY BLOB WORKER:
+   The app is a single HTML file, so we can't have a separate
+   worker.js file. We encode the worker as a string and create
+   a Blob URL. This avoids UI thread freezes during:
+     • transformers.js module initialisation (~3 MB)
+     • Model weight downloads (network I/O)
+     • ONNX inference (heavy math)
+
+   COMMUNICATION PROTOCOL:
+   ┌─────────────────────────────────────────────────────────┐
+   │ Main → Worker                                           │
+   │  { type: 'init' }          — load model                 │
+   │  { type: 'segment',        — run inference              │
+   │    imageData: ImageData,                                │
+   │    width, height }                                      │
+   ├─────────────────────────────────────────────────────────┤
+   │ Worker → Main                                           │
+   │  { type: 'progress',       — download progress          │
+   │    file, progress,                                      │
+   │    loaded, total }                                      │
+   │  { type: 'ready' }         — model loaded, UI unlocks   │
+   │  { type: 'result',         — inference done             │
+   │    masks: [...],           — array of {label, mask}     │
+   │    width, height }                                      │
+   │  { type: 'error', message }— something went wrong       │
+   └─────────────────────────────────────────────────────────┘
+═══════════════════════════════════════════════════════════ */
+const WORKER_SOURCE = `
+// ── Worker: runs transformers.js in isolation from the UI thread ──
+
+// Import transformers.js v3 from CDN.
+// We use the ESM bundle; workers support importScripts OR dynamic import.
+// Using dynamic import for ES module compatibility.
+let pipeline, env;
+
+// Self-invoking async to allow top-level await pattern.
+(async () => {
+  try {
+    // Import transformers.js v3 ESM from jsDelivr CDN.
+    const module = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3/dist/transformers.min.js');
+    pipeline = module.pipeline;
+    env = module.env;
+
+    // ── BACKEND CONFIGURATION ──
+    // Attempt WebGPU first for hardware-accelerated inference.
+    // transformers.js v3 auto-detects the best backend if we
+    // set allowLocalModels: false and let it negotiate.
+    env.allowLocalModels = false;         // models come from HuggingFace Hub
+    env.useBrowserCache  = true;          // cache weights in IndexedDB after first download
+
+    // Prefer WebGPU; the library falls back to WASM automatically
+    // when WebGPU is unavailable (e.g. iOS, older browsers).
+    env.backends.onnx.wasm.numThreads = navigator.hardwareConcurrency ?? 2;
+
+  } catch (err) {
+    self.postMessage({ type: 'error', message: 'Failed to load transformers.js: ' + err.message });
+    return;
+  }
+
+  // ── MODEL PIPELINE ──
+  // 'image-segmentation' pipeline with segformer_b2_clothes.
+  // This model outputs per-pixel class labels including:
+  // 'Upper-clothes', 'Pants', 'Dress', 'Coat', 'Skirt', etc.
+  let segmentPipeline = null;
+
+  // Handle messages from the main thread.
+  self.addEventListener('message', async (event) => {
+    const { type, imageData, width, height } = event.data;
+
+    // ── INIT: Load and warm-up the model ──
+    if (type === 'init') {
+      try {
+        segmentPipeline = await pipeline(
+          'image-segmentation',
+          'Xenova/segformer_b2_clothes',
+          {
+            // Progress callback — streams download % to the main thread.
+            progress_callback: (progressInfo) => {
+              // progressInfo structure from transformers.js v3:
+              // { status: 'downloading'|'loading'|'ready', file, progress, loaded, total }
+              if (progressInfo.status === 'downloading' || progressInfo.status === 'progress') {
+                self.postMessage({
+                  type: 'progress',
+                  file: progressInfo.file || '',
+                  progress: progressInfo.progress ?? 0,   // 0–100
+                  loaded: progressInfo.loaded ?? 0,
+                  total: progressInfo.total ?? 0,
+                });
+              }
+            },
+          }
+        );
+        self.postMessage({ type: 'ready' });
+      } catch (err) {
+        self.postMessage({ type: 'error', message: 'Model load failed: ' + err.message });
+      }
+      return;
+    }
+
+    // ── SEGMENT: Run inference on a frame ──
+    if (type === 'segment') {
+      if (!segmentPipeline) {
+        self.postMessage({ type: 'error', message: 'Model not ready yet.' });
+        return;
+      }
+
+      try {
+        // Reconstruct an ImageData object inside the worker.
+        // The ImageData was transferred as a raw Uint8ClampedArray.
+        const reconstructed = new ImageData(
+          new Uint8ClampedArray(imageData),
+          width,
+          height
+        );
+
+        // Run the segmentation pipeline.
+        // Result is an array of { label: string, mask: RawImage } objects.
+        const results = await segmentPipeline(reconstructed);
+
+        // Serialise the masks as plain typed arrays for transfer
+        // (RawImage objects are not directly transferable).
+        const masks = results.map(r => ({
+          label: r.label,
+          // mask.data is a Uint8ClampedArray of the same (width × height) size.
+          // Value 255 = this pixel belongs to this class; 0 = doesn't.
+          maskData: Array.from(r.mask.data),
+          width: r.mask.width,
+          height: r.mask.height,
+        }));
+
+        self.postMessage({ type: 'result', masks, srcWidth: width, srcHeight: height });
+      } catch (err) {
+        self.postMessage({ type: 'error', message: 'Inference failed: ' + err.message });
+      }
+      return;
+    }
+  });
+
+  // Signal to the main thread that the worker script is ready to receive 'init'.
+  self.postMessage({ type: 'worker-script-ready' });
+})();
+`;
+
+/* ═══════════════════════════════════════════════════════════
+   CREATE WORKER FROM BLOB
+   We encode the worker source as a Blob with MIME type
+   'application/javascript' and create an Object URL.
+═══════════════════════════════════════════════════════════ */
+const workerBlob = new Blob([WORKER_SOURCE], { type: 'application/javascript' });
+const workerURL  = URL.createObjectURL(workerBlob);
+const worker     = new Worker(workerURL, { type: 'module' });
+
+/* ═══════════════════════════════════════════════════════════
+   DEMO GARMENTS
+   Instead of requiring external hosted PNGs, we generate
+   simple coloured T-shirt / garment silhouettes on <canvas>
+   and export them as data-URLs. This makes the app 100%
+   self-contained with zero external asset dependencies.
+   Users can replace these with real product PNGs.
+═══════════════════════════════════════════════════════════ */
+function generateGarmentDataURL(color, label) {
+  const c   = document.createElement('canvas');
+  c.width   = 200;
+  c.height  = 240;
+  const ctx = c.getContext('2d');
+
+  // Draw a simple T-shirt silhouette as SVG path on canvas.
+  // Path: neckline, shoulders, sleeves, body, hem.
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  // Neck dip
+  ctx.moveTo(80, 30);
+  ctx.quadraticCurveTo(100, 60, 120, 30);
+  // Right shoulder to sleeve tip
+  ctx.lineTo(170, 10);
+  // Right sleeve bottom
+  ctx.lineTo(185, 70);
+  // Right side body
+  ctx.lineTo(150, 80);
+  ctx.lineTo(155, 210);
+  // Hem bottom
+  ctx.lineTo(45, 210);
+  // Left side body
+  ctx.lineTo(50, 80);
+  // Left sleeve bottom
+  ctx.lineTo(15, 70);
+  // Left shoulder
+  ctx.lineTo(30, 10);
+  ctx.closePath();
+  ctx.fill();
+
+  // Subtle shading for depth
+  const grad = ctx.createLinearGradient(0, 0, 200, 240);
+  grad.addColorStop(0, 'rgba(255,255,255,.18)');
+  grad.addColorStop(1, 'rgba(0,0,0,.22)');
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  ctx.moveTo(80, 30);
+  ctx.quadraticCurveTo(100, 60, 120, 30);
+  ctx.lineTo(170, 10); ctx.lineTo(185, 70);
+  ctx.lineTo(150, 80); ctx.lineTo(155, 210);
+  ctx.lineTo(45, 210); ctx.lineTo(50, 80);
+  ctx.lineTo(15, 70);  ctx.lineTo(30, 10);
+  ctx.closePath();
+  ctx.fill();
+
+  return c.toDataURL('image/png');
+}
+
+// The built-in garment options
+const BUILT_IN_GARMENTS = [
+  { label: 'Navy Tee',     color: '#1e3a5f' },
+  { label: 'Crimson Top',  color: '#8b0000' },
+  { label: 'Forest Green', color: '#1a472a' },
+  { label: 'Ivory Blouse', color: '#f5f0e8' },
+  { label: 'Slate Grey',   color: '#4a5568' },
+  { label: 'Gold Shirt',   color: '#b7791f' },
+].map(g => ({ ...g, dataURL: generateGarmentDataURL(g.color, g.label) }));
+
+/* ═══════════════════════════════════════════════════════════
+   APP STATE
+═══════════════════════════════════════════════════════════ */
+const state = {
+  modelReady:       false,    // true once worker signals 'ready'
+  webcamActive:     false,    // true when getUserMedia stream is running
+  stream:           null,     // MediaStream object
+  photoMode:        false,    // true when a static photo is loaded
+  selectedGarment:  null,     // { label, dataURL } of chosen clothing
+  garmentImage:     null,     // HTMLImageElement of selected garment
+  latestMasks:      null,     // { masks, srcWidth, srcHeight } from last inference
+  inferenceRunning: false,    // prevent overlapping segment calls
+  overlayOpacity:   0.85,     // from the slider (0–1)
+  rafId:            null,     // requestAnimationFrame id
+};
+
+/* ═══════════════════════════════════════════════════════════
+   DOM REFS
+═══════════════════════════════════════════════════════════ */
+const $overlay       = document.getElementById('loading-overlay');
+const $progressFill  = document.getElementById('progress-fill');
+const $progressLabel = document.getElementById('progress-label');
+const $statusText    = document.getElementById('loading-status-text');
+const $progressTrack = document.getElementById('progress-bar-track');
+const $canvas        = document.getElementById('try-on-canvas');
+const $canvasPlaceholder = document.getElementById('canvas-placeholder');
+const $video         = document.getElementById('webcam-video');
+const $photo         = document.getElementById('static-photo');
+const $statusDot     = document.getElementById('status-dot');
+const $statusTxt     = document.getElementById('status-text');
+const $inferenceBadge = document.getElementById('inference-badge');
+const $inferenceText = document.getElementById('inference-text');
+const $clothingGrid  = document.getElementById('clothing-grid');
+const $btnWebcam     = document.getElementById('btn-webcam');
+const $btnStop       = document.getElementById('btn-stop');
+const $btnSave       = document.getElementById('btn-save');
+const $photoUpload   = document.getElementById('photo-upload');
+const $clothingUpload = document.getElementById('clothing-upload');
+const $opacitySlider = document.getElementById('opacity-slider');
+const $errorToast    = document.getElementById('error-toast');
+const ctx            = $canvas.getContext('2d');
+
+/* ═══════════════════════════════════════════════════════════
+   ERROR TOAST HELPER
+═══════════════════════════════════════════════════════════ */
+let toastTimer = null;
+function showError(msg) {
+  $errorToast.textContent = msg;
+  $errorToast.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => $errorToast.classList.remove('show'), 5000);
+  console.error('[VTON]', msg);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   WORKER MESSAGE HANDLER
+   Routes incoming messages from the Web Worker.
+═══════════════════════════════════════════════════════════ */
+worker.addEventListener('message', (event) => {
+  const msg = event.data;
+
+  switch (msg.type) {
+
+    // Worker script finished loading its own imports.
+    case 'worker-script-ready':
+      // Immediately request model initialisation.
+      worker.postMessage({ type: 'init' });
+      break;
+
+    // Model weight download progress.
+    case 'progress': {
+      const pct = Math.round(msg.progress ?? 0);
+      $progressFill.style.width = pct + '%';
+      $progressTrack.setAttribute('aria-valuenow', pct);
+      // Show the currently-downloading file (strip path for readability).
+      const fileName = msg.file ? msg.file.split('/').pop() : '';
+      const mbLoaded = msg.loaded ? (msg.loaded / 1_048_576).toFixed(1) : '?';
+      const mbTotal  = msg.total  ? (msg.total  / 1_048_576).toFixed(1) : '?';
+      $progressLabel.textContent = fileName
+        ? `${fileName} — ${mbLoaded} / ${mbTotal} MB (${pct}%)`
+        : `Downloading… ${pct}%`;
+      $statusText.textContent = `Downloading model weights. This happens once; subsequent visits use the cached version.`;
+      break;
+    }
+
+    // Model is fully loaded — hide loading overlay.
+    case 'ready':
+      state.modelReady = true;
+      $progressFill.style.width = '100%';
+      $progressLabel.textContent = 'Model ready! ✓';
+      $statusText.textContent = 'Model loaded. Starting app…';
+      setTimeout(() => {
+        $overlay.classList.add('hidden');
+        // Remove from DOM after transition to avoid focus-trap.
+        setTimeout(() => $overlay.remove(), 600);
+      }, 700);
+      break;
+
+    // Segmentation result received.
+    case 'result':
+      state.inferenceRunning = false;
+      state.latestMasks = {
+        masks:     msg.masks,
+        srcWidth:  msg.srcWidth,
+        srcHeight: msg.srcHeight,
+      };
+      $inferenceBadge.classList.remove('visible');
+      break;
+
+    // Non-fatal error from worker.
+    case 'error':
+      state.inferenceRunning = false;
+      $inferenceBadge.classList.remove('visible');
+      showError(msg.message);
+      break;
+  }
+});
+
+// Handle worker-level exceptions (e.g. network failure loading CDN script).
+worker.addEventListener('error', (e) => {
+  showError('Web Worker error: ' + e.message);
+});
+
+/* ═══════════════════════════════════════════════════════════
+   CLOTHING PICKER — populate the grid
+═══════════════════════════════════════════════════════════ */
+function buildClothingGrid() {
+  $clothingGrid.innerHTML = '';
+
+  BUILT_IN_GARMENTS.forEach((garment, idx) => {
+    const item = document.createElement('div');
+    item.className = 'clothing-item';
+    item.setAttribute('role', 'button');
+    item.setAttribute('tabindex', '0');
+    item.setAttribute('aria-label', `Select ${garment.label}`);
+    item.dataset.idx = idx;
+
+    const img = document.createElement('img');
+    img.src = garment.dataURL;
+    img.alt = garment.label;
+
+    const label = document.createElement('div');
+    label.className = 'clothing-label';
+    label.textContent = garment.label;
+
+    const badge = document.createElement('div');
+    badge.className = 'selected-badge';
+    badge.textContent = '✓';
+
+    item.appendChild(img);
+    item.appendChild(label);
+    item.appendChild(badge);
+
+    // Click or keyboard activation
+    const selectFn = () => selectGarment(garment, item);
+    item.addEventListener('click', selectFn);
+    item.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectFn(); } });
+
+    $clothingGrid.appendChild(item);
+  });
+}
+
+/* Select a garment and pre-load its Image element */
+function selectGarment(garment, el) {
+  // Deselect previous
+  document.querySelectorAll('.clothing-item.selected')
+    .forEach(i => i.classList.remove('selected'));
+
+  el.classList.add('selected');
+  state.selectedGarment = garment;
+
+  // Pre-load the garment image for canvas compositing.
+  const img  = new Image();
+  img.onload = () => { state.garmentImage = img; };
+  img.src    = garment.dataURL;
+
+  // Reset masks so a fresh inference will be requested.
+  state.latestMasks = null;
+}
+
+buildClothingGrid();
+
+/* ─── Custom garment upload ─── */
+$clothingUpload.addEventListener('change', (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+
+  const url = URL.createObjectURL(file);
+  const garment = { label: file.name.replace(/\.[^.]+$/, ''), dataURL: url };
+
+  // Add to front of list and create a grid item.
+  BUILT_IN_GARMENTS.unshift(garment);
+  buildClothingGrid();
+
+  // Auto-select the newly uploaded garment.
+  const firstItem = $clothingGrid.querySelector('.clothing-item');
+  selectGarment(garment, firstItem);
+  firstItem.classList.add('selected');
+});
+
+/* ═══════════════════════════════════════════════════════════
+   CAMERA / PHOTO INPUT
+═══════════════════════════════════════════════════════════ */
+
+/* ── Start Webcam ── */
+$btnWebcam.addEventListener('click', async () => {
+  // If already streaming, do nothing.
+  if (state.webcamActive) return;
+
+  try {
+    // Request camera access with ideal 640×480; mobile will use front cam.
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+      audio: false,
+    });
+
+    $video.srcObject = stream;
+    await $video.play();
+
+    state.stream      = stream;
+    state.webcamActive = true;
+    state.photoMode   = false;
+
+    // Update UI
+    $btnWebcam.style.display = 'none';
+    $btnStop.style.display   = '';
+    setStatus('active', 'Webcam active');
+    $canvasPlaceholder.classList.add('hidden');
+
+    // Size canvas to match video dimensions.
+    $video.addEventListener('loadedmetadata', () => {
+      $canvas.width  = $video.videoWidth;
+      $canvas.height = $video.videoHeight;
+    }, { once: true });
+
+    // Kick off the render loop.
+    startRenderLoop();
+
+  } catch (err) {
+    if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+      showError('Camera permission denied. Please allow camera access and try again.');
+      setStatus('error', 'Camera permission denied.');
+    } else if (err.name === 'NotFoundError') {
+      showError('No camera found on this device.');
+      setStatus('error', 'No camera found.');
+    } else {
+      showError('Could not start camera: ' + err.message);
+      setStatus('error', 'Camera error.');
+    }
+  }
+});
+
+/* ── Stop Webcam ── */
+$btnStop.addEventListener('click', stopWebcam);
+
+function stopWebcam() {
+  if (state.stream) {
+    state.stream.getTracks().forEach(t => t.stop());
+    state.stream = null;
+  }
+  $video.srcObject = null;
+  state.webcamActive = false;
+
+  $btnWebcam.style.display = '';
+  $btnStop.style.display   = 'none';
+  setStatus('', 'No source active.');
+
+  stopRenderLoop();
+}
+
+/* ── Upload Photo ── */
+$photoUpload.addEventListener('change', (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+
+  // Stop any existing webcam stream.
+  if (state.webcamActive) stopWebcam();
+
+  const url = URL.createObjectURL(file);
+  $photo.onload = () => {
+    // Size the canvas to match the uploaded image.
+    $canvas.width  = $photo.naturalWidth;
+    $canvas.height = $photo.naturalHeight;
+    state.photoMode   = true;
+    state.latestMasks = null; // force new segmentation
+    $canvasPlaceholder.classList.add('hidden');
+    setStatus('active', 'Static photo loaded.');
+    startRenderLoop();
+  };
+  $photo.onerror = () => showError('Could not load the selected image.');
+  $photo.src = url;
+});
+
+/* ── Status dot helper ── */
+function setStatus(type, text) {
+  $statusDot.className = 'status-dot' + (type ? ' ' + type : '');
+  $statusTxt.textContent = text;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   RENDER LOOP
+   Uses requestAnimationFrame to continuously:
+   1. Draw the current frame (webcam or static photo) to canvas.
+   2. If a garment is selected, overlay it using the latest mask.
+   3. Every N frames, send a frame to the worker for new segmentation.
+═══════════════════════════════════════════════════════════ */
+const SEGMENT_INTERVAL_FRAMES = 15; // run inference every 15 frames (~4Hz at 60fps)
+let frameCount = 0;
+
+function startRenderLoop() {
+  stopRenderLoop(); // cancel any existing loop
+  renderFrame();
+}
+
+function stopRenderLoop() {
+  if (state.rafId !== null) {
+    cancelAnimationFrame(state.rafId);
+    state.rafId = null;
+  }
+}
+
+function renderFrame() {
+  state.rafId = requestAnimationFrame(renderFrame);
+
+  // Determine source element.
+  const source = state.webcamActive ? $video : (state.photoMode ? $photo : null);
+  if (!source) return;
+
+  // For video, ensure we have actual frame data.
+  if (state.webcamActive && ($video.readyState < 2)) return;
+
+  const W = $canvas.width;
+  const H = $canvas.height;
+  if (W === 0 || H === 0) return;
+
+  // ── Draw background frame ──
+  ctx.drawImage(source, 0, 0, W, H);
+
+  // ── Overlay clothing if garment selected and masks available ──
+  if (state.garmentImage && state.latestMasks) {
+    drawClothingOverlay(W, H);
+  }
+
+  // ── Periodically request new segmentation from the worker ──
+  frameCount++;
+  const shouldSegment =
+    state.modelReady &&
+    state.selectedGarment &&
+    !state.inferenceRunning &&
+    (frameCount % SEGMENT_INTERVAL_FRAMES === 0 || (state.latestMasks === null && frameCount % 3 === 0));
+
+  if (shouldSegment) {
+    requestSegmentation(source, W, H);
+  }
+}
+
+/* ── Send a frame to the worker for segmentation ── */
+function requestSegmentation(source, W, H) {
+  try {
+    // Sample at half resolution to speed up inference without major accuracy loss.
+    const sampleW = Math.min(W, 320);
+    const sampleH = Math.round(H * (sampleW / W));
+
+    // Draw to an off-screen canvas at sample resolution.
+    const offscreen = document.createElement('canvas');
+    offscreen.width  = sampleW;
+    offscreen.height = sampleH;
+    const offCtx = offscreen.getContext('2d');
+    offCtx.drawImage(source, 0, 0, sampleW, sampleH);
+
+    const imageData = offCtx.getImageData(0, 0, sampleW, sampleH);
+
+    state.inferenceRunning = true;
+    $inferenceBadge.classList.add('visible');
+    $inferenceText.textContent = 'Segmenting…';
+
+    // Transfer the pixel buffer to the worker.
+    // We use transfer for performance; imageData.data is the underlying buffer.
+    worker.postMessage(
+      { type: 'segment', imageData: imageData.data.buffer, width: sampleW, height: sampleH },
+      [imageData.data.buffer]   // transferable — avoids copying
+    );
+  } catch (err) {
+    state.inferenceRunning = false;
+    showError('Could not read frame: ' + err.message);
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   CLOTHING OVERLAY RENDERING
+   Algorithm:
+   1. Find the "Upper-clothes" mask (or closest match).
+   2. Compute its bounding box in mask coordinates.
+   3. Map bbox to canvas coordinates.
+   4. Scale + position the garment PNG to fit the bbox.
+   5. Draw with globalAlpha = overlayOpacity.
+
+   IMPORTANT: We do NOT warp or deform the garment image —
+   that would require a GPU shader. Instead we do affine
+   scaling + translation, which works well for frontal poses.
+═══════════════════════════════════════════════════════════ */
+
+// Labels that represent upper-body clothing (in priority order).
+const UPPER_BODY_LABELS = [
+  'Upper-clothes', 'Shirt', 'Blouse', 'Top',
+  'Jacket', 'Coat', 'Sweater', 'T-shirt',
+  'Dress',  // fallback: dresses cover upper body too
+];
+
+function drawClothingOverlay(canvasW, canvasH) {
+  const { masks, srcWidth, srcHeight } = state.latestMasks;
+
+  // Find the best-matching mask.
+  let targetMask = null;
+  for (const label of UPPER_BODY_LABELS) {
+    const found = masks.find(m => m.label.toLowerCase().includes(label.toLowerCase()));
+    if (found) { targetMask = found; break; }
+  }
+
+  // Fallback: use the largest mask by pixel count.
+  if (!targetMask && masks.length > 0) {
+    targetMask = masks.reduce((best, m) => {
+      const count = m.maskData.filter(v => v > 127).length;
+      return count > (best._count ?? 0) ? { ...m, _count: count } : best;
+    }, masks[0]);
+  }
+
+  if (!targetMask) return;
+
+  // ── Compute bounding box in mask-space ──
+  const mW = targetMask.width;
+  const mH = targetMask.height;
+  const data = targetMask.maskData;
+
+  let minX = mW, maxX = 0, minY = mH, maxY = 0;
+  let pixelCount = 0;
+
+  for (let y = 0; y < mH; y++) {
+    for (let x = 0; x < mW; x++) {
+      if (data[y * mW + x] > 127) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        pixelCount++;
+      }
+    }
+  }
+
+  if (pixelCount === 0) return; // nothing found
+
+  // Add a small padding so the garment doesn't feel cramped.
+  const PAD_H = Math.round((maxX - minX) * 0.06);
+  const PAD_V = Math.round((maxY - minY) * 0.04);
+  minX = Math.max(0, minX - PAD_H);
+  maxX = Math.min(mW - 1, maxX + PAD_H);
+  minY = Math.max(0, minY - PAD_V);
+  maxY = Math.min(mH - 1, maxY + PAD_V);
+
+  // ── Map bbox to canvas coordinates ──
+  // The mask was computed on a down-sampled frame; scale back up.
+  const scaleX = canvasW / srcWidth;
+  const scaleY = canvasH / srcHeight;
+
+  const bboxX = minX * scaleX;
+  const bboxY = minY * scaleY;
+  const bboxW = (maxX - minX) * scaleX;
+  const bboxH = (maxY - minY) * scaleY;
+
+  if (bboxW < 10 || bboxH < 10) return;
+
+  // ── Draw garment PNG scaled to bounding box ──
+  const g = state.garmentImage;
+  const garmentAspect = g.naturalWidth / g.naturalHeight;
+  const bboxAspect    = bboxW / bboxH;
+
+  let drawW, drawH, drawX, drawY;
+
+  if (garmentAspect > bboxAspect) {
+    // Garment is wider than bbox — fit width.
+    drawW = bboxW;
+    drawH = bboxW / garmentAspect;
+    drawX = bboxX;
+    drawY = bboxY + (bboxH - drawH) / 2;
+  } else {
+    // Garment is taller — fit height.
+    drawH = bboxH;
+    drawW = bboxH * garmentAspect;
+    drawX = bboxX + (bboxW - drawW) / 2;
+    drawY = bboxY;
+  }
+
+  ctx.save();
+  ctx.globalAlpha = state.overlayOpacity;
+  ctx.drawImage(g, drawX, drawY, drawW, drawH);
+  ctx.restore();
+}
+
+/* ═══════════════════════════════════════════════════════════
+   UI CONTROLS
+═══════════════════════════════════════════════════════════ */
+
+// Opacity slider
+$opacitySlider.addEventListener('input', () => {
+  state.overlayOpacity = $opacitySlider.value / 100;
+});
+
+// Save / screenshot
+$btnSave.addEventListener('click', () => {
+  try {
+    const link = document.createElement('a');
+    link.download = 'virtual-try-on.png';
+    link.href = $canvas.toDataURL('image/png');
+    link.click();
+  } catch (err) {
+    showError('Could not save image: ' + err.message);
+  }
+});
+
+</script>
+</body>
+</html>
