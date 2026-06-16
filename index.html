@@ -758,7 +758,7 @@ let pipeline, env;
 
   // Handle messages from the main thread.
   self.addEventListener('message', async (event) => {
-    const { type, imageData, width, height } = event.data;
+    const { type } = event.data;
 
     // ── INIT: Load and warm-up the model ──
     if (type === 'init') {
@@ -798,17 +798,18 @@ let pipeline, env;
       }
 
       try {
-        // Reconstruct an ImageData object inside the worker.
-        // The ImageData was transferred as a raw Uint8ClampedArray.
-        const reconstructed = new ImageData(
-          new Uint8ClampedArray(imageData),
-          width,
-          height
-        );
+        // FIX: transformers.js v3 pipeline does NOT accept a raw ImageData
+        // or Uint8ClampedArray object — it throws "Unsupported input type: object".
+        // The correct input types are:
+        //   • A URL string  (http/https/data:)
+        //   • A base64 data-URL string  ← we use this
+        //   • A File / Blob object
+        // The main thread now sends a base64 PNG data-URL; pass it straight through.
+        const { dataURL } = event.data;
 
         // Run the segmentation pipeline.
         // Result is an array of { label: string, mask: RawImage } objects.
-        const results = await segmentPipeline(reconstructed);
+        const results = await segmentPipeline(dataURL);
 
         // Serialise the masks as plain typed arrays for transfer
         // (RawImage objects are not directly transferable).
@@ -821,7 +822,10 @@ let pipeline, env;
           height: r.mask.height,
         }));
 
-        self.postMessage({ type: 'result', masks, srcWidth: width, srcHeight: height });
+        // Use the first mask's dimensions as the reference size (all masks share the same size).
+        const refW = masks.length > 0 ? masks[0].width : event.data.width;
+        const refH = masks.length > 0 ? masks[0].height : event.data.height;
+        self.postMessage({ type: 'result', masks, srcWidth: refW, srcHeight: refH });
       } catch (err) {
         self.postMessage({ type: 'error', message: 'Inference failed: ' + err.message });
       }
@@ -1269,8 +1273,9 @@ function renderFrame() {
 /* ── Send a frame to the worker for segmentation ── */
 function requestSegmentation(source, W, H) {
   try {
-    // Sample at half resolution to speed up inference without major accuracy loss.
-    const sampleW = Math.min(W, 320);
+    // Sample at reduced resolution to speed up inference without major accuracy loss.
+    // 512px wide is a good balance — segformer was trained at 512×512.
+    const sampleW = Math.min(W, 512);
     const sampleH = Math.round(H * (sampleW / W));
 
     // Draw to an off-screen canvas at sample resolution.
@@ -1280,18 +1285,19 @@ function requestSegmentation(source, W, H) {
     const offCtx = offscreen.getContext('2d');
     offCtx.drawImage(source, 0, 0, sampleW, sampleH);
 
-    const imageData = offCtx.getImageData(0, 0, sampleW, sampleH);
+    // FIX: Export as a base64 PNG data-URL.
+    // transformers.js v3's image-segmentation pipeline only accepts:
+    //   string (URL or data-URL), File, Blob — NOT raw ImageData / ArrayBuffer.
+    // Using 'image/jpeg' at 0.85 quality keeps the payload smaller than PNG
+    // while still giving the model enough detail for good segmentation.
+    const dataURL = offscreen.toDataURL('image/jpeg', 0.85);
 
     state.inferenceRunning = true;
     $inferenceBadge.classList.add('visible');
     $inferenceText.textContent = 'Segmenting…';
 
-    // Transfer the pixel buffer to the worker.
-    // We use transfer for performance; imageData.data is the underlying buffer.
-    worker.postMessage(
-      { type: 'segment', imageData: imageData.data.buffer, width: sampleW, height: sampleH },
-      [imageData.data.buffer]   // transferable — avoids copying
-    );
+    // Send to worker. No transferables needed (string is already cheap to copy).
+    worker.postMessage({ type: 'segment', dataURL, width: sampleW, height: sampleH });
   } catch (err) {
     state.inferenceRunning = false;
     showError('Could not read frame: ' + err.message);
